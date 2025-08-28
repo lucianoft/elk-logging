@@ -1,0 +1,155 @@
+version: '3.8'
+
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=true
+      - xpack.security.authc.api_key.enabled=true
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD:-Elastic123!}
+      - KIBANA_SYSTEM_PASSWORD=${KIBANA_SYSTEM_PASSWORD:-Kibana123!}
+      - LOGSTASH_SYSTEM_PASSWORD=${LOGSTASH_SYSTEM_PASSWORD:-Logstash123!}
+      - xpack.security.authc anonymous.username=anonymous
+      - xpack.security.authc anonymous.roles=remote_monitoring_collector
+      - xpack.security.authc anonymous.authz_exception=false
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+      - ./elasticsearch/scripts:/usr/share/elasticsearch/scripts
+    ports:
+      - "9200:9200"
+    networks:
+      - elk-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "-u", "elastic:${ELASTIC_PASSWORD:-Elastic123!}", "http://localhost:9200"]
+      interval: 30s
+      timeout: 30s
+      retries: 15
+      start_period: 120s
+    restart: unless-stopped
+    mem_limit: 2g
+    command: >
+      /bin/sh -c "
+      /usr/local/bin/docker-entrypoint.sh eswrapper &
+      PID=$$!;
+      /usr/share/elasticsearch/scripts/setup-users.sh;
+      wait $$PID
+      "
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.13.4
+    container_name: logstash
+    environment:
+      - LS_JAVA_OPTS=${LS_JAVA_OPTS:--Xms512m -Xmx512m}
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - ELASTICSEARCH_HOST=elasticsearch
+      - ELASTICSEARCH_PORT=9200
+      - ELASTICSEARCH_USERNAME=logstash_system
+      - ELASTICSEARCH_PASSWORD=${LOGSTASH_SYSTEM_PASSWORD:-Logstash123!}
+      - LOGSTASH_SYSTEM_PASSWORD=${LOGSTASH_SYSTEM_PASSWORD:-Logstash123!}
+      - KIBANA_SYSTEM_PASSWORD="${KIBANA_SYSTEM_PASSWORD:-Kibana123!}"
+      - ELASTICSEARCH_SSL_VERIFICATIONMODE=none
+      - XPACK_MONITORING_ENABLED=false
+      - XPACK_MANAGEMENT_ENABLED=false
+    volumes:
+      - ./logstash/pipeline:/usr/share/logstash/pipeline
+      - ./logstash/config:/usr/share/logstash/config
+      - ./logstash/patterns:/usr/share/logstash/patterns
+      - logstash_data:/usr/share/logstash/data
+    ports:
+      - "5000:5000"    # TCP input
+      - "5000:5000/udp" # UDP input
+      - "5044:5044"    # Beats input
+      - "9600:9600"    # Logstash API
+    networks:
+      - elk-network
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9600/_node/stats"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.13.4
+    container_name: kibana
+    environment:
+      - SERVER_NAME=kibana
+      - KIBANA_URL=${KIBANA_URL:-http://localhost:5601}
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - ELASTICSEARCH_USERNAME=kibana_system 
+      - ELASTICSEARCH_PASSWORD=${KIBANA_SYSTEM_PASSWORD:-Kibana123!}  
+      - SERVER_HOST=0.0.0.0
+      - ELASTICSEARCH_SSL_VERIFICATIONMODE=none
+      - ELASTICSEARCH_REQUEST_TIMEOUT=120000
+      - NODE_OPTIONS=--max-old-space-size=1024
+    ports:
+      - "5601:5601"
+    networks:
+      - elk-network
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: |
+        bash -c '
+        echo "[$(date +%T)] Healthcheck test started"
+      
+        # Verificar se Kibana está respondendo
+        if curl -f http://localhost:5601/api/status >/dev/null 2>&1; then
+          echo "[$(date +%T)] Kibana API is responsive"
+        
+        # Executar setup apenas uma vez
+        if [ ! -f /tmp/setup-completed ]; then
+          echo "[$(date +%T)] Running setup script..."
+          if /usr/local/bin/kibana-setup.sh; then
+            echo "[$(date +%T)] Setup completed successfully"
+              touch /tmp/setup-completed
+          else
+              echo "[$(date +%T)] Setup failed"
+              exit 1
+            fi
+          else
+            echo "[$(date +%T)] Setup already completed - skipping"
+          fi
+        
+          exit 0
+        else
+        echo "[$(date +%T)] Kibana API not ready yet"
+        exit 1
+        fi
+        '
+      interval: 30s
+      timeout: 300s
+      retries: 5
+      start_period: 300s
+    volumes:
+      - ./kibana/data:/usr/share/kibana/data
+      - ./kibana/setup/kibana_setup.sh:/usr/local/bin/kibana-setup.sh  
+      - ./kibana/setup/kibana-entrypoint.sh:/usr/local/bin/kibana-entrypoint.sh
+    
+    restart: unless-stopped
+    mem_limit: 1g
+
+volumes:
+  elasticsearch_data:
+    driver: local
+  logstash_data:
+    driver: local
+
+networks:
+  elk-network:
+    driver: bridge
